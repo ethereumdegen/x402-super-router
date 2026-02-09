@@ -1,0 +1,5 @@
+.git
+target
+.env
+public/gifs/*.gif
+public/images/*.png
