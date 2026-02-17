@@ -2,6 +2,7 @@ use std::env;
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    pub test_mode: bool,
     pub port: u16,
     pub facilitator_url: String,
     pub facilitator_signer: String,
@@ -15,11 +16,23 @@ pub struct Config {
     pub fal_key: String,
     pub public_url: String,
     pub endpoints_config_path: String,
+    pub s3_endpoint: String,
+    pub s3_bucket: String,
+    pub s3_region: String,
+    pub s3_access_key: String,
+    pub s3_secret_key: String,
+    pub s3_cdn_url: String,
+    pub database_url: String,
 }
 
 impl Config {
     pub fn from_env() -> Self {
+        let test_mode = env::var("TEST_MODE")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+
         Self {
+            test_mode,
             port: env::var("PORT")
                 .unwrap_or_else(|_| "3402".to_string())
                 .parse()
@@ -27,8 +40,9 @@ impl Config {
             facilitator_url: env::var("FACILITATOR_URL")
                 .unwrap_or_else(|_| "https://facilitator.x402.org".to_string()),
             facilitator_signer: env::var("FACILITATOR_SIGNER")
-                .expect("FACILITATOR_SIGNER must be set"),
-            wallet_address: env::var("WALLET_ADDRESS").expect("WALLET_ADDRESS must be set"),
+                .unwrap_or_else(|_| if test_mode { String::new() } else { panic!("FACILITATOR_SIGNER must be set") }),
+            wallet_address: env::var("WALLET_ADDRESS")
+                .unwrap_or_else(|_| if test_mode { String::new() } else { panic!("WALLET_ADDRESS must be set") }),
             payment_network: env::var("PAYMENT_NETWORK")
                 .unwrap_or_else(|_| "base".to_string()),
             payment_token_address: env::var("PAYMENT_TOKEN_ADDRESS")
@@ -48,6 +62,13 @@ impl Config {
                 .unwrap_or_else(|_| "http://localhost:3402".to_string()),
             endpoints_config_path: env::var("ENDPOINTS_CONFIG")
                 .unwrap_or_else(|_| "endpoints.ron".to_string()),
+            s3_endpoint: env::var("S3_ENDPOINT").expect("S3_ENDPOINT must be set"),
+            s3_bucket: env::var("S3_BUCKET").expect("S3_BUCKET must be set"),
+            s3_region: env::var("S3_REGION").unwrap_or_else(|_| "nyc3".to_string()),
+            s3_access_key: env::var("S3_ACCESS_KEY").expect("S3_ACCESS_KEY must be set"),
+            s3_secret_key: env::var("S3_SECRET_KEY").expect("S3_SECRET_KEY must be set"),
+            s3_cdn_url: env::var("S3_CDN_URL").expect("S3_CDN_URL must be set"),
+            database_url: env::var("DATABASE_URL").expect("DATABASE_URL must be set"),
         }
     }
 }

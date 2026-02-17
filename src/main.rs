@@ -1,25 +1,28 @@
 use std::sync::Arc;
 
-use axum::{Router, response::Json, routing::get};
+use actix_cors::Cors;
+use actix_governor::{Governor, GovernorConfigBuilder};
+use actix_web::{web, App, HttpResponse, HttpServer, middleware};
 use serde::Serialize;
-use tower_http::cors::{Any, CorsLayer};
-use tower_http::services::ServeDir;
-use tower_http::trace::TraceLayer;
 
+mod cleanup;
 mod config;
+mod db;
 mod domain_types;
 mod endpoints;
 mod handler;
+mod s3;
 mod x402;
 
 use config::Config;
 use endpoints::EndpointDef;
 
-#[derive(Clone)]
 pub struct AppState {
     pub config: Config,
     pub http_client: reqwest::Client,
     pub endpoints: Arc<Vec<EndpointDef>>,
+    pub db_pool: sqlx::PgPool,
+    pub s3_client: aws_sdk_s3::Client,
 }
 
 #[derive(Serialize)]
@@ -39,9 +42,7 @@ struct InfoResponse {
     network: String,
 }
 
-async fn info(
-    axum::extract::State(state): axum::extract::State<AppState>,
-) -> Json<InfoResponse> {
+async fn info(state: web::Data<AppState>) -> HttpResponse {
     let endpoint_infos: Vec<EndpointInfo> = state
         .endpoints
         .iter()
@@ -53,7 +54,7 @@ async fn info(
         })
         .collect();
 
-    Json(InfoResponse {
+    HttpResponse::Ok().json(InfoResponse {
         service: "x402-super-router",
         version: env!("CARGO_PKG_VERSION"),
         endpoints: endpoint_infos,
@@ -62,9 +63,7 @@ async fn info(
     })
 }
 
-async fn info_text(
-    axum::extract::State(state): axum::extract::State<AppState>,
-) -> String {
+async fn info_text(state: web::Data<AppState>) -> HttpResponse {
     let mut out = String::new();
     out.push_str("x402-super-router\n");
     out.push_str(&format!("version: {}\n", env!("CARGO_PKG_VERSION")));
@@ -85,17 +84,23 @@ async fn info_text(
     out.push_str("  Send a GET request to any endpoint above.\n");
     out.push_str("  Without an X-PAYMENT header, you'll receive a 402 with payment requirements.\n");
     out.push_str("  Include a valid X-PAYMENT header (base64-encoded permit) to generate content.\n");
-    out
+    HttpResponse::Ok()
+        .content_type("text/plain")
+        .body(out)
 }
 
-#[tokio::main]
-async fn main() {
+async fn health() -> HttpResponse {
+    HttpResponse::Ok().json(serde_json::json!({"status": "ok"}))
+}
+
+#[actix_web::main]
+async fn main() -> std::io::Result<()> {
     dotenvy::dotenv().ok();
 
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "x402_super_router=debug,tower_http=debug".into()),
+                .unwrap_or_else(|_| "x402_super_router=debug,actix_web=info".into()),
         )
         .init();
 
@@ -112,61 +117,96 @@ async fn main() {
 
     let endpoint_defs = Arc::new(endpoints_config.endpoints);
 
+    // Initialize DB pool
+    tracing::info!("Connecting to database...");
+    let db_pool = db::create_pool(&config.database_url).await;
+    tracing::info!("Database connected");
+
+    // Initialize S3 client
+    let s3_client = s3::create_s3_client(&config);
+    tracing::info!("S3 client initialized (endpoint: {})", config.s3_endpoint);
+
+    // Create tmp dir for ffmpeg temp files
+    std::fs::create_dir_all("tmp").expect("Failed to create tmp/ directory");
+
     tracing::info!("x402-super-router starting");
+    if config.test_mode {
+        tracing::warn!("  *** TEST_MODE ENABLED — all x402 payments are bypassed ***");
+    }
     tracing::info!("  Network: {}", config.payment_network);
     tracing::info!("  Wallet: {}", config.wallet_address);
     tracing::info!("  Facilitator: {}", config.facilitator_url);
-    tracing::info!("  Public URL: {}", config.public_url);
+    tracing::info!("  S3 Bucket: {}", config.s3_bucket);
+    tracing::info!("  S3 CDN: {}", config.s3_cdn_url);
     tracing::info!("  Endpoints loaded: {}", endpoint_defs.len());
     for ep in endpoint_defs.iter() {
         tracing::info!("    {} -> {} ({})", ep.path, ep.fal_model, ep.description);
     }
 
-    let state = AppState {
+    // Spawn cleanup worker with broadcast shutdown channel
+    let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+    tokio::spawn(cleanup::run_cleanup_worker(
+        db_pool.clone(),
+        s3_client.clone(),
+        config.s3_bucket.clone(),
+        shutdown_rx,
+    ));
+    tracing::info!("Cleanup worker spawned");
+
+    // Rate limiting: 10 requests per minute per IP on generation endpoints
+    let governor_conf = GovernorConfigBuilder::default()
+        .seconds_per_request(6)
+        .burst_size(10)
+        .finish()
+        .unwrap();
+
+    let state = web::Data::new(AppState {
         config,
         http_client: reqwest::Client::new(),
         endpoints: Arc::clone(&endpoint_defs),
-    };
+        db_pool,
+        s3_client,
+    });
 
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any)
-        .expose_headers(Any);
+    let endpoint_defs_for_factory = endpoint_defs.clone();
 
-    // Build router dynamically from endpoint config
-    let mut app = Router::new()
-        .route("/", get(info_text))
-        .route("/api", get(info));
+    tracing::info!("Listening on 0.0.0.0:{}", port);
 
-    for ep in endpoint_defs.iter() {
-        // Create cache dir at startup
-        std::fs::create_dir_all(&ep.cache_dir)
-            .unwrap_or_else(|e| panic!("Failed to create cache dir '{}': {}", ep.cache_dir, e));
+    HttpServer::new(move || {
+        let cors = Cors::default()
+            .allow_any_origin()
+            .allow_any_method()
+            .allow_any_header()
+            .expose_any_header();
 
-        let ep_arc = Arc::new(ep.clone());
-        app = app
-            .route(&ep.path, handler::make_endpoint_route(ep_arc))
-            .nest_service(&ep.static_serve_path, ServeDir::new(&ep.cache_dir));
-    }
+        let mut app = App::new()
+            .app_data(state.clone())
+            .wrap(cors)
+            .wrap(middleware::Logger::default())
+            .route("/", web::get().to(info_text))
+            .route("/api", web::get().to(info))
+            .route("/api/health", web::get().to(health));
 
-    let app = app
-        .layer(cors)
-        .layer(TraceLayer::new_for_http())
-        .with_state(state);
+        // Register each dynamic endpoint with rate limiting + its EndpointDef as app_data
+        for ep in endpoint_defs_for_factory.iter() {
+            let ep_data = web::Data::new(ep.clone());
+            app = app.service(
+                web::resource(&ep.path)
+                    .app_data(ep_data)
+                    .wrap(Governor::new(&governor_conf))
+                    .route(web::get().to(handler::handle_generate)),
+            );
+        }
 
-    let addr = format!("0.0.0.0:{}", port);
-    tracing::info!("Listening on {}", addr);
+        app
+    })
+    .bind(format!("0.0.0.0:{}", port))?
+    .run()
+    .await?;
 
-    let listener = tokio::net::TcpListener::bind(&addr)
-        .await
-        .expect("Failed to bind");
+    // Server stopped — signal cleanup worker
+    tracing::info!("Shutting down");
+    let _ = shutdown_tx.send(());
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            tokio::signal::ctrl_c().await.ok();
-            tracing::info!("Shutting down");
-        })
-        .await
-        .expect("Server failed");
+    Ok(())
 }

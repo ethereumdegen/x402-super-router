@@ -1,21 +1,19 @@
 use std::path::Path;
-use std::sync::Arc;
 
-use axum::extract::{Query, State};
-use axum::http::HeaderMap;
-use axum::response::Json;
-use axum::routing::{MethodRouter, get};
+use actix_web::{web, HttpRequest, HttpResponse};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::AppState;
+use crate::db;
 use crate::domain_types::DomainU256;
 use crate::endpoints::{EndpointDef, PostProcess, extract_url};
+use crate::s3;
 use crate::x402;
 
 #[derive(Deserialize)]
-struct PromptQuery {
-    prompt: Option<String>,
+pub struct PromptQuery {
+    pub prompt: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -42,29 +40,33 @@ async fn download_url(http_client: &reqwest::Client, url: &str) -> Result<Vec<u8
         .map_err(|e| format!("Failed to read download bytes: {}", e))
 }
 
-fn error_response(msg: String) -> axum::response::Response {
-    axum::response::Response::builder()
-        .status(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
-        .header("content-type", "text/plain")
-        .body(axum::body::Body::from(msg))
-        .unwrap()
+pub async fn handle_generate(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    endpoint: web::Data<EndpointDef>,
+    query: web::Query<PromptQuery>,
+) -> HttpResponse {
+    match handle_endpoint_inner(&state, &req, query.prompt.as_deref(), &endpoint).await {
+        Ok(resp) => resp,
+        Err(resp) => resp,
+    }
 }
 
-async fn handle_endpoint(
+async fn handle_endpoint_inner(
     state: &AppState,
-    headers: &HeaderMap,
+    req: &HttpRequest,
     prompt: Option<&str>,
     endpoint: &EndpointDef,
-) -> Result<Json<GenerateResponse>, axum::response::Response> {
+) -> Result<HttpResponse, HttpResponse> {
     let cost = DomainU256::from_string(&endpoint.cost).map_err(|e| {
         tracing::error!("Bad cost in endpoint {}: {}", endpoint.path, e);
-        error_response(format!("Internal config error: {}", e))
+        HttpResponse::InternalServerError().body(format!("Internal config error: {}", e))
     })?;
 
-    x402::require_x402_payment(
+    let (payment_tx, payer_address) = x402::require_x402_payment(
         &state.config,
         &state.http_client,
-        headers,
+        req.headers(),
         cost,
         &endpoint.path,
         &endpoint.description,
@@ -79,19 +81,16 @@ async fn handle_endpoint(
         hex::encode(h.finalize())
     };
 
-    let filename = format!("{}.{}", hash, endpoint.output_extension);
-    let cache_path = Path::new(&endpoint.cache_dir).join(&filename);
-
-    let was_cached = cache_path.exists();
-    if was_cached {
+    // Cache check: query DB instead of filesystem
+    if let Ok(Some(record)) = db::find_by_prompt_hash(&state.db_pool, &hash, &endpoint.path).await
+    {
         tracing::info!(
             "[{}] Cache hit for prompt: {}",
             endpoint.path,
             effective
         );
-        let url = public_url(&state.config, &endpoint.static_serve_path, &filename);
-        return Ok(Json(GenerateResponse {
-            url,
+        return Ok(HttpResponse::Ok().json(GenerateResponse {
+            url: record.s3_url,
             prompt: effective.to_string(),
             cached: true,
             media_type: endpoint.media_type.clone(),
@@ -124,19 +123,19 @@ async fn handle_endpoint(
         .await
         .map_err(|e| {
             tracing::error!("[{}] FAL request failed: {}", endpoint.path, e);
-            error_response(format!("FAL request failed: {}", e))
+            HttpResponse::InternalServerError().body(format!("FAL request failed: {}", e))
         })?;
 
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         tracing::error!("[{}] FAL error {}: {}", endpoint.path, status, body);
-        return Err(error_response(format!("FAL error {}: {}", status, body)));
+        return Err(HttpResponse::InternalServerError().body(format!("FAL error {}: {}", status, body)));
     }
 
     let resp_json: serde_json::Value = response.json().await.map_err(|e| {
         tracing::error!("[{}] Failed to parse FAL response: {}", endpoint.path, e);
-        error_response(format!("Failed to parse FAL response: {}", e))
+        HttpResponse::InternalServerError().body(format!("Failed to parse FAL response: {}", e))
     })?;
 
     let result_url = extract_url(&resp_json, &endpoint.response_url_path).map_err(|e| {
@@ -146,48 +145,42 @@ async fn handle_endpoint(
             e,
             serde_json::to_string_pretty(&resp_json).unwrap_or_default()
         );
-        error_response(format!("No result URL in FAL response: {}", e))
+        HttpResponse::InternalServerError().body(format!("No result URL in FAL response: {}", e))
     })?;
 
     let result_bytes = download_url(&state.http_client, &result_url)
         .await
         .map_err(|e| {
             tracing::error!("[{}] Download failed: {}", endpoint.path, e);
-            error_response(e)
+            HttpResponse::InternalServerError().body(e)
         })?;
 
-    std::fs::create_dir_all(&endpoint.cache_dir).map_err(|e| {
-        tracing::error!("[{}] Failed to create cache dir: {}", endpoint.path, e);
-        error_response(format!("Failed to create cache dir: {}", e))
-    })?;
-
-    // Post-process or save directly
-    match &endpoint.post_process {
-        PostProcess::None => {
-            std::fs::write(&cache_path, &result_bytes).map_err(|e| {
-                tracing::error!("[{}] Failed to save file: {}", endpoint.path, e);
-                error_response(format!("Failed to save file: {}", e))
-            })?;
-        }
+    // Post-process if needed (ffmpeg uses tmp/ dir for temp files)
+    let final_bytes = match &endpoint.post_process {
+        PostProcess::None => result_bytes,
         PostProcess::FfmpegToGif {
             input_extension,
             ffmpeg_args,
         } => {
-            let tmp_path =
-                Path::new(&endpoint.cache_dir).join(format!("{}.{}", hash, input_extension));
+            std::fs::create_dir_all("tmp").map_err(|e| {
+                HttpResponse::InternalServerError().body(format!("Failed to create tmp dir: {}", e))
+            })?;
 
-            std::fs::write(&tmp_path, &result_bytes).map_err(|e| {
+            let tmp_input = Path::new("tmp").join(format!("{}.{}", hash, input_extension));
+            let tmp_output = Path::new("tmp").join(format!("{}.{}", hash, endpoint.output_extension));
+
+            std::fs::write(&tmp_input, &result_bytes).map_err(|e| {
                 tracing::error!("[{}] Failed to save temp file: {}", endpoint.path, e);
-                error_response(format!("Failed to save temp file: {}", e))
+                HttpResponse::InternalServerError().body(format!("Failed to save temp file: {}", e))
             })?;
 
             let mut cmd_args = vec![
                 "-i".to_string(),
-                tmp_path.to_string_lossy().to_string(),
+                tmp_input.to_string_lossy().to_string(),
             ];
             cmd_args.extend(ffmpeg_args.iter().cloned());
             cmd_args.push("-y".to_string());
-            cmd_args.push(cache_path.to_string_lossy().to_string());
+            cmd_args.push(tmp_output.to_string_lossy().to_string());
 
             let output = tokio::process::Command::new("ffmpeg")
                 .args(&cmd_args)
@@ -195,51 +188,87 @@ async fn handle_endpoint(
                 .await
                 .map_err(|e| {
                     tracing::error!("[{}] ffmpeg failed: {}", endpoint.path, e);
-                    error_response(format!(
+                    HttpResponse::InternalServerError().body(format!(
                         "ffmpeg failed to execute (is it installed?): {}",
                         e
                     ))
                 })?;
 
-            let _ = std::fs::remove_file(&tmp_path);
+            let _ = std::fs::remove_file(&tmp_input);
 
             if !output.status.success() {
+                let _ = std::fs::remove_file(&tmp_output);
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 tracing::error!("[{}] ffmpeg conversion failed: {}", endpoint.path, stderr);
-                return Err(error_response(format!(
+                return Err(HttpResponse::InternalServerError().body(format!(
                     "ffmpeg conversion failed: {}",
                     stderr
                 )));
             }
+
+            let converted = std::fs::read(&tmp_output).map_err(|e| {
+                HttpResponse::InternalServerError().body(format!("Failed to read ffmpeg output: {}", e))
+            })?;
+            let _ = std::fs::remove_file(&tmp_output);
+            converted
         }
+    };
+
+    // S3 key: endpoint_path_without_leading_slash/hash.ext
+    let path_segment = endpoint.path.trim_start_matches('/');
+    let s3_key = format!("{}/{}.{}", path_segment, hash, endpoint.output_extension);
+
+    let content_type = match endpoint.output_extension.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "mp4" => "video/mp4",
+        "webp" => "image/webp",
+        _ => "application/octet-stream",
+    };
+
+    let file_size = final_bytes.len() as i64;
+
+    // Upload to S3
+    s3::upload_file(
+        &state.s3_client,
+        &state.config.s3_bucket,
+        &s3_key,
+        final_bytes,
+        content_type,
+    )
+    .await
+    .map_err(|e| {
+        tracing::error!("[{}] S3 upload failed: {}", endpoint.path, e);
+        HttpResponse::InternalServerError().body(e)
+    })?;
+
+    let cdn_url = s3::cdn_url(&state.config, &s3_key);
+
+    tracing::info!("[{}] Uploaded to S3: {}", endpoint.path, cdn_url);
+
+    // Insert DB record
+    if let Err(e) = db::insert_media(
+        &state.db_pool,
+        &endpoint.path,
+        effective,
+        &hash,
+        &s3_key,
+        &cdn_url,
+        &endpoint.media_type,
+        file_size,
+        payer_address.as_deref(),
+        payment_tx.as_deref(),
+    )
+    .await
+    {
+        tracing::error!("[{}] Failed to insert DB record: {}", endpoint.path, e);
     }
 
-    tracing::info!("[{}] Saved to {}", endpoint.path, cache_path.display());
-
-    let url = public_url(&state.config, &endpoint.static_serve_path, &filename);
-    Ok(Json(GenerateResponse {
-        url,
+    Ok(HttpResponse::Ok().json(GenerateResponse {
+        url: cdn_url,
         prompt: effective.to_string(),
         cached: false,
         media_type: endpoint.media_type.clone(),
     }))
-}
-
-fn public_url(config: &crate::config::Config, serve_path: &str, filename: &str) -> String {
-    format!(
-        "{}{}/{}",
-        config.public_url.trim_end_matches('/'),
-        serve_path,
-        filename
-    )
-}
-
-/// Create an Axum route handler for a given endpoint definition.
-pub fn make_endpoint_route(endpoint: Arc<EndpointDef>) -> MethodRouter<AppState> {
-    get(move |State(state): State<AppState>,
-              headers: HeaderMap,
-              Query(query): Query<PromptQuery>| {
-        let ep = Arc::clone(&endpoint);
-        async move { handle_endpoint(&state, &headers, query.prompt.as_deref(), &ep).await }
-    })
 }

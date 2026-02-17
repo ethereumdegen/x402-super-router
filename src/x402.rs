@@ -1,8 +1,6 @@
-use axum::{
-    body::Body,
-    http::{header, HeaderMap, StatusCode},
-    response::Response,
-};
+use actix_web::http::header::HeaderMap;
+use actix_web::http::StatusCode;
+use actix_web::HttpResponse;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
 
@@ -101,28 +99,23 @@ fn payment_required_response(
     amount: DomainU256,
     resource: &str,
     description: &str,
-) -> Response {
+) -> HttpResponse {
     let requirements = build_payment_requirements(config, amount, resource, description);
     let response = PaymentRequiredResponse {
         x402_version: 1,
         accepts: vec![requirements],
         error: None,
     };
-    let body = serde_json::to_string(&response).unwrap_or_default();
 
-    Response::builder()
-        .status(StatusCode::PAYMENT_REQUIRED)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(body))
-        .unwrap()
+    HttpResponse::build(StatusCode::PAYMENT_REQUIRED)
+        .content_type("application/json")
+        .json(response)
 }
 
-fn error_response(status: StatusCode, message: &str) -> Response {
-    Response::builder()
-        .status(status)
-        .header(header::CONTENT_TYPE, "text/plain")
-        .body(Body::from(message.to_string()))
-        .unwrap()
+fn error_response(status: StatusCode, message: &str) -> HttpResponse {
+    HttpResponse::build(status)
+        .content_type("text/plain")
+        .body(message.to_string())
 }
 
 async fn verify_payment(
@@ -178,7 +171,8 @@ async fn settle_payment(
 // ── Public API ──
 
 /// Check X-PAYMENT header, verify with facilitator, and settle.
-/// Returns Ok(tx_hash) on success, Err(Response) if payment is missing/invalid.
+/// Returns Ok((tx_hash, payer_address)) on success, Err(HttpResponse) if payment is missing/invalid.
+/// When TEST_MODE is enabled, payment is skipped entirely.
 pub async fn require_x402_payment(
     config: &Config,
     http_client: &reqwest::Client,
@@ -186,7 +180,12 @@ pub async fn require_x402_payment(
     amount: DomainU256,
     resource: &str,
     description: &str,
-) -> Result<Option<String>, Response> {
+) -> Result<(Option<String>, Option<String>), HttpResponse> {
+    if config.test_mode {
+        tracing::debug!("TEST_MODE: skipping x402 payment for {}", resource);
+        return Ok((None, None));
+    }
+
     let payment_header = headers.get("X-PAYMENT").and_then(|v| v.to_str().ok());
 
     match payment_header {
@@ -243,7 +242,7 @@ pub async fn require_x402_payment(
 
             if settle_resp.success {
                 tracing::info!("Payment settled: {:?}", settle_resp.transaction);
-                Ok(settle_resp.transaction)
+                Ok((settle_resp.transaction, settle_resp.payer))
             } else {
                 let reason = settle_resp.error_reason.unwrap_or_default();
                 tracing::error!("Settlement failed: {}", reason);
