@@ -51,9 +51,9 @@ pub async fn handle_generate(
     req: HttpRequest,
     state: web::Data<AppState>,
     quality_map: web::Data<QualityMap>,
-    query: web::Query<PromptQuery>,
+    body: web::Json<PromptQuery>,
 ) -> HttpResponse {
-    let quality = &query.quality;
+    let quality = &body.quality;
     let endpoint = match quality_map.get(quality.as_str()) {
         Some(ep) => ep,
         None => {
@@ -64,7 +64,7 @@ pub async fn handle_generate(
         }
     };
 
-    match handle_endpoint_inner(&state, &req, query.prompt.as_deref(), endpoint, quality).await {
+    match handle_endpoint_inner(&state, &req, body.prompt.as_deref(), endpoint, quality).await {
         Ok(resp) => resp,
         Err(resp) => resp,
     }

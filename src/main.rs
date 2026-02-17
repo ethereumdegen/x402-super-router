@@ -114,7 +114,7 @@ async fn info_text(state: web::Data<AppState>) -> HttpResponse {
 
     for route in &route_keys {
         let quality_map = &grouped[route];
-        out.push_str(&format!("\n  GET {}?quality=low|medium|high&prompt=<text>\n", route));
+        out.push_str(&format!("\n  POST {}  {{\"quality\": \"low|medium|high\", \"prompt\": \"<text>\"}}\n", route));
 
         let mut quality_keys: Vec<String> = quality_map.keys().cloned().collect();
         quality_keys.sort();
@@ -134,7 +134,7 @@ async fn info_text(state: web::Data<AppState>) -> HttpResponse {
     }
 
     out.push_str("\n--- payment ---\n\n");
-    out.push_str("  Send a GET request to any route above.\n");
+    out.push_str("  Send a POST request with JSON body to any route above.\n");
     out.push_str("  Without an X-PAYMENT header, you'll receive a 402 with payment requirements.\n");
     out.push_str("  Include a valid X-PAYMENT header (base64-encoded permit) to generate content.\n");
     HttpResponse::Ok()
@@ -268,7 +268,7 @@ async fn main() -> std::io::Result<()> {
                 web::resource(route)
                     .app_data(qm_data)
                     .wrap(Governor::new(&governor_conf))
-                    .route(web::get().to(handler::handle_generate)),
+                    .route(web::post().to(handler::handle_generate)),
             );
         }
 
