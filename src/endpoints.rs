@@ -8,6 +8,8 @@ pub struct EndpointsConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct EndpointDef {
+    pub route: String,
+    pub quality: String,
     pub path: String,
     pub fal_model: String,
     pub cost: String,
@@ -17,8 +19,6 @@ pub struct EndpointDef {
     pub default_prompt: String,
     pub media_type: String,
     pub output_extension: String,
-    pub cache_dir: String,
-    pub static_serve_path: String,
     pub post_process: PostProcess,
 }
 
@@ -29,6 +29,21 @@ pub enum PostProcess {
         input_extension: String,
         ffmpeg_args: Vec<String>,
     },
+}
+
+/// Maps quality level (e.g. "low", "medium", "high") to an EndpointDef.
+pub type QualityMap = HashMap<String, EndpointDef>;
+
+/// Group flat endpoint list by route, producing a map of route -> quality -> EndpointDef.
+pub fn group_by_route(endpoints: &[EndpointDef]) -> HashMap<String, QualityMap> {
+    let mut grouped: HashMap<String, QualityMap> = HashMap::new();
+    for ep in endpoints {
+        grouped
+            .entry(ep.route.clone())
+            .or_default()
+            .insert(ep.quality.clone(), ep.clone());
+    }
+    grouped
 }
 
 pub fn load_endpoints(path: &str) -> EndpointsConfig {

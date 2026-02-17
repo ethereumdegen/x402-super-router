@@ -7,13 +7,19 @@ use sha2::{Digest, Sha256};
 use crate::AppState;
 use crate::db;
 use crate::domain_types::DomainU256;
-use crate::endpoints::{EndpointDef, PostProcess, extract_url};
+use crate::endpoints::{EndpointDef, PostProcess, QualityMap, extract_url};
 use crate::s3;
 use crate::x402;
 
 #[derive(Deserialize)]
 pub struct PromptQuery {
     pub prompt: Option<String>,
+    #[serde(default = "default_quality")]
+    pub quality: String,
+}
+
+fn default_quality() -> String {
+    "low".to_string()
 }
 
 #[derive(Serialize)]
@@ -23,6 +29,7 @@ struct GenerateResponse {
     cached: bool,
     #[serde(rename = "type")]
     media_type: String,
+    quality: String,
 }
 
 async fn download_url(http_client: &reqwest::Client, url: &str) -> Result<Vec<u8>, String> {
@@ -43,10 +50,21 @@ async fn download_url(http_client: &reqwest::Client, url: &str) -> Result<Vec<u8
 pub async fn handle_generate(
     req: HttpRequest,
     state: web::Data<AppState>,
-    endpoint: web::Data<EndpointDef>,
+    quality_map: web::Data<QualityMap>,
     query: web::Query<PromptQuery>,
 ) -> HttpResponse {
-    match handle_endpoint_inner(&state, &req, query.prompt.as_deref(), &endpoint).await {
+    let quality = &query.quality;
+    let endpoint = match quality_map.get(quality.as_str()) {
+        Some(ep) => ep,
+        None => {
+            let valid: Vec<&String> = quality_map.keys().collect();
+            return HttpResponse::BadRequest().json(serde_json::json!({
+                "error": format!("Invalid quality '{}'. Valid options: {:?}", quality, valid)
+            }));
+        }
+    };
+
+    match handle_endpoint_inner(&state, &req, query.prompt.as_deref(), endpoint, quality).await {
         Ok(resp) => resp,
         Err(resp) => resp,
     }
@@ -57,11 +75,13 @@ async fn handle_endpoint_inner(
     req: &HttpRequest,
     prompt: Option<&str>,
     endpoint: &EndpointDef,
+    quality: &str,
 ) -> Result<HttpResponse, HttpResponse> {
-    let cost = DomainU256::from_string(&endpoint.cost).map_err(|e| {
-        tracing::error!("Bad cost in endpoint {}: {}", endpoint.path, e);
-        HttpResponse::InternalServerError().body(format!("Internal config error: {}", e))
-    })?;
+    let cost = DomainU256::from_human_amount(&endpoint.cost, state.config.payment_token_decimals)
+        .map_err(|e| {
+            tracing::error!("Bad cost in endpoint {}: {}", endpoint.path, e);
+            HttpResponse::InternalServerError().body(format!("Internal config error: {}", e))
+        })?;
 
     let (payment_tx, payer_address) = x402::require_x402_payment(
         &state.config,
@@ -94,6 +114,7 @@ async fn handle_endpoint_inner(
             prompt: effective.to_string(),
             cached: true,
             media_type: endpoint.media_type.clone(),
+            quality: quality.to_string(),
         }));
     }
 
@@ -270,5 +291,6 @@ async fn handle_endpoint_inner(
         prompt: effective.to_string(),
         cached: false,
         media_type: endpoint.media_type.clone(),
+        quality: quality.to_string(),
     }))
 }

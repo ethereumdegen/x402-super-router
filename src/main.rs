@@ -26,38 +26,74 @@ pub struct AppState {
 }
 
 #[derive(Serialize)]
-struct EndpointInfo {
-    path: String,
-    description: String,
+struct QualityInfo {
+    quality: String,
+    model: String,
     cost: String,
+    cost_raw: String,
+    description: String,
+}
+
+#[derive(Serialize)]
+struct RouteInfo {
+    route: String,
     media_type: String,
+    default_quality: &'static str,
+    qualities: Vec<QualityInfo>,
 }
 
 #[derive(Serialize)]
 struct InfoResponse {
     service: &'static str,
     version: &'static str,
-    endpoints: Vec<EndpointInfo>,
+    routes: Vec<RouteInfo>,
     token: String,
     network: String,
 }
 
 async fn info(state: web::Data<AppState>) -> HttpResponse {
-    let endpoint_infos: Vec<EndpointInfo> = state
-        .endpoints
-        .iter()
-        .map(|ep| EndpointInfo {
-            path: ep.path.clone(),
-            description: ep.description.clone(),
-            cost: ep.cost.clone(),
-            media_type: ep.media_type.clone(),
-        })
-        .collect();
+    let grouped = endpoints::group_by_route(&state.endpoints);
+    let mut routes: Vec<RouteInfo> = Vec::new();
+
+    let mut route_keys: Vec<String> = grouped.keys().cloned().collect();
+    route_keys.sort();
+
+    for route in &route_keys {
+        let quality_map = &grouped[route];
+        let sample = quality_map.values().next().unwrap();
+
+        let mut qualities: Vec<QualityInfo> = Vec::new();
+        let mut quality_keys: Vec<String> = quality_map.keys().cloned().collect();
+        quality_keys.sort();
+
+        for q in &quality_keys {
+            let ep = &quality_map[q];
+            let raw_cost = domain_types::DomainU256::from_human_amount(
+                &ep.cost,
+                state.config.payment_token_decimals,
+            )
+            .expect("cost validated at startup");
+            qualities.push(QualityInfo {
+                quality: q.clone(),
+                model: ep.fal_model.clone(),
+                cost: ep.cost.clone(),
+                cost_raw: raw_cost.to_string(),
+                description: ep.description.clone(),
+            });
+        }
+
+        routes.push(RouteInfo {
+            route: route.clone(),
+            media_type: sample.media_type.clone(),
+            default_quality: "low",
+            qualities,
+        });
+    }
 
     HttpResponse::Ok().json(InfoResponse {
         service: "x402-super-router",
         version: env!("CARGO_PKG_VERSION"),
-        endpoints: endpoint_infos,
+        routes,
         token: state.config.payment_token_address.clone(),
         network: state.config.payment_network.clone(),
     })
@@ -70,18 +106,35 @@ async fn info_text(state: web::Data<AppState>) -> HttpResponse {
     out.push_str(&format!("network: {}\n", state.config.payment_network));
     out.push_str(&format!("token: {} ({})\n", state.config.payment_token_symbol, state.config.payment_token_address));
     out.push_str(&format!("wallet: {}\n", state.config.wallet_address));
-    out.push_str("\n--- endpoints ---\n\n");
-    for ep in state.endpoints.iter() {
-        out.push_str(&format!("  GET {}\n", ep.path));
-        out.push_str(&format!("    {}\n", ep.description));
-        out.push_str(&format!("    model: {}\n", ep.fal_model));
-        out.push_str(&format!("    type: {}\n", ep.media_type));
-        out.push_str(&format!("    cost: {} (raw wei)\n", ep.cost));
-        out.push_str(&format!("    query: ?prompt=<text>  (default: \"{}\")\n", ep.default_prompt));
-        out.push_str("\n");
+    out.push_str("\n--- routes ---\n");
+
+    let grouped = endpoints::group_by_route(&state.endpoints);
+    let mut route_keys: Vec<String> = grouped.keys().cloned().collect();
+    route_keys.sort();
+
+    for route in &route_keys {
+        let quality_map = &grouped[route];
+        out.push_str(&format!("\n  GET {}?quality=low|medium|high&prompt=<text>\n", route));
+
+        let mut quality_keys: Vec<String> = quality_map.keys().cloned().collect();
+        quality_keys.sort();
+
+        for q in &quality_keys {
+            let ep = &quality_map[q];
+            let raw_cost = domain_types::DomainU256::from_human_amount(
+                &ep.cost,
+                state.config.payment_token_decimals,
+            )
+            .expect("cost validated at startup");
+            out.push_str(&format!(
+                "    {} : {} {} (model: {}, raw: {})\n",
+                q, ep.cost, state.config.payment_token_symbol, ep.fal_model, raw_cost
+            ));
+        }
     }
-    out.push_str("--- payment ---\n\n");
-    out.push_str("  Send a GET request to any endpoint above.\n");
+
+    out.push_str("\n--- payment ---\n\n");
+    out.push_str("  Send a GET request to any route above.\n");
     out.push_str("  Without an X-PAYMENT header, you'll receive a 402 with payment requirements.\n");
     out.push_str("  Include a valid X-PAYMENT header (base64-encoded permit) to generate content.\n");
     HttpResponse::Ok()
@@ -109,10 +162,26 @@ async fn main() -> std::io::Result<()> {
 
     let endpoints_config = endpoints::load_endpoints(&config.endpoints_config_path);
 
-    // Validate all costs parse as DomainU256 at startup
+    // Validate all costs parse at startup
     for ep in &endpoints_config.endpoints {
-        domain_types::DomainU256::from_string(&ep.cost)
+        let raw = domain_types::DomainU256::from_human_amount(&ep.cost, config.payment_token_decimals)
             .unwrap_or_else(|e| panic!("Bad cost '{}' for endpoint {}: {}", ep.cost, ep.path, e));
+        tracing::info!(
+            "  {} [{}] cost: {} {} (raw: {})",
+            ep.route,
+            ep.quality,
+            ep.cost,
+            config.payment_token_symbol,
+            raw
+        );
+    }
+
+    // Group endpoints by route and validate each route has a "low" variant (the default)
+    let grouped = endpoints::group_by_route(&endpoints_config.endpoints);
+    for (route, quality_map) in &grouped {
+        if !quality_map.contains_key("low") {
+            panic!("Route '{}' is missing a 'low' quality variant (required as default)", route);
+        }
     }
 
     let endpoint_defs = Arc::new(endpoints_config.endpoints);
@@ -138,9 +207,13 @@ async fn main() -> std::io::Result<()> {
     tracing::info!("  Facilitator: {}", config.facilitator_url);
     tracing::info!("  S3 Bucket: {}", config.s3_bucket);
     tracing::info!("  S3 CDN: {}", config.s3_cdn_url);
-    tracing::info!("  Endpoints loaded: {}", endpoint_defs.len());
-    for ep in endpoint_defs.iter() {
-        tracing::info!("    {} -> {} ({})", ep.path, ep.fal_model, ep.description);
+    tracing::info!("  Routes: {}", grouped.len());
+    for (route, quality_map) in &grouped {
+        let qualities: Vec<&String> = quality_map.keys().collect();
+        tracing::info!("    {} -> qualities: {:?}", route, qualities);
+        for (q, ep) in quality_map {
+            tracing::info!("      {} : {} ({})", q, ep.fal_model, ep.description);
+        }
     }
 
     // Spawn cleanup worker with broadcast shutdown channel
@@ -168,7 +241,8 @@ async fn main() -> std::io::Result<()> {
         s3_client,
     });
 
-    let endpoint_defs_for_factory = endpoint_defs.clone();
+    // Build the grouped quality maps for route registration
+    let grouped_for_factory = Arc::new(grouped);
 
     tracing::info!("Listening on 0.0.0.0:{}", port);
 
@@ -187,12 +261,12 @@ async fn main() -> std::io::Result<()> {
             .route("/api", web::get().to(info))
             .route("/api/health", web::get().to(health));
 
-        // Register each dynamic endpoint with rate limiting + its EndpointDef as app_data
-        for ep in endpoint_defs_for_factory.iter() {
-            let ep_data = web::Data::new(ep.clone());
+        // Register one route per group, injecting the QualityMap as app_data
+        for (route, quality_map) in grouped_for_factory.as_ref() {
+            let qm_data = web::Data::new(quality_map.clone());
             app = app.service(
-                web::resource(&ep.path)
-                    .app_data(ep_data)
+                web::resource(route)
+                    .app_data(qm_data)
                     .wrap(Governor::new(&governor_conf))
                     .route(web::get().to(handler::handle_generate)),
             );
