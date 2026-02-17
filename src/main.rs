@@ -36,6 +36,7 @@ struct QualityInfo {
 
 #[derive(Serialize)]
 struct RouteInfo {
+    method: &'static str,
     route: String,
     media_type: String,
     default_quality: &'static str,
@@ -83,6 +84,7 @@ async fn info(state: web::Data<AppState>) -> HttpResponse {
         }
 
         routes.push(RouteInfo {
+            method: "POST",
             route: route.clone(),
             media_type: sample.media_type.clone(),
             default_quality: "low",
