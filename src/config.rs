@@ -67,7 +67,11 @@ impl Config {
             s3_region: env::var("S3_REGION").unwrap_or_else(|_| "nyc3".to_string()),
             s3_access_key: env::var("S3_ACCESS_KEY").expect("S3_ACCESS_KEY must be set"),
             s3_secret_key: env::var("S3_SECRET_KEY").expect("S3_SECRET_KEY must be set"),
-            s3_cdn_url: env::var("S3_CDN_URL").expect("S3_CDN_URL must be set"),
+            s3_cdn_url: env::var("S3_CDN_URL").unwrap_or_else(|_| {
+                let bucket = env::var("S3_BUCKET").expect("S3_BUCKET must be set");
+                let region = env::var("S3_REGION").unwrap_or_else(|_| "nyc3".to_string());
+                format!("https://{}.{}.digitaloceanspaces.com", bucket, region)
+            }),
             database_url: env::var("DATABASE_URL").expect("DATABASE_URL must be set"),
         }
     }

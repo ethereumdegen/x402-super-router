@@ -40,6 +40,12 @@ cp .env.example .env
 | `FACILITATOR_SIGNER` | Ethereum address of the x402 facilitator signer |
 | `WALLET_ADDRESS` | Your wallet address to receive payments |
 | `FAL_KEY` | API key from [fal.ai](https://fal.ai/dashboard/keys) |
+| `S3_ENDPOINT` | S3-compatible storage endpoint (e.g. `https://nyc3.digitaloceanspaces.com`) |
+| `S3_BUCKET` | S3 bucket name |
+| `S3_ACCESS_KEY` | S3 access key ID |
+| `S3_SECRET_KEY` | S3 secret access key |
+| `S3_CDN_URL` | *optional* — CDN URL for S3 assets; defaults to `https://{S3_BUCKET}.{S3_REGION}.digitaloceanspaces.com` |
+| `DATABASE_URL` | PostgreSQL connection URL (e.g. `postgresql://user:pass@host:5432/db`) |
 
 ### Optional
 
@@ -53,8 +59,12 @@ cp .env.example .env
 | `PAYMENT_TOKEN_DECIMALS` | `18` | Token decimal places |
 | `PAYMENT_TOKEN_NAME` | `StarkBot` | Token name (used in EIP-712 domain) |
 | `PAYMENT_TOKEN_VERSION` | `1` | Token contract version |
+| `COST_PER_IMAGE` | `1000000000000000000000` | Cost in raw token units for image generation |
+| `COST_PER_GIF` | `1000000000000000000000` | Cost in raw token units for GIF generation |
 | `PUBLIC_URL` | `http://localhost:3402` | Public base URL for returned media links |
+| `S3_REGION` | `nyc3` | S3 region identifier |
 | `ENDPOINTS_CONFIG` | `endpoints.ron` | Path to endpoints config file |
+| `TEST_MODE` | `0` | Set to `1` to bypass payment verification |
 | `RUST_LOG` | `x402_super_router=debug,tower_http=debug` | Logging filter |
 
 ## Building & Running
@@ -68,6 +78,52 @@ Or during development:
 
 ```sh
 cargo run
+```
+
+## Testing
+
+### Quick smoke test (no payment required)
+
+Enable test mode to bypass x402 payment verification:
+
+```sh
+TEST_MODE=1 cargo run
+```
+
+Then hit an endpoint:
+
+```sh
+# Should return JSON with a generated image URL
+curl "http://localhost:3402/generate_image?prompt=a+cat"
+```
+
+Without `TEST_MODE`, the same request returns HTTP 402 with payment requirements — useful for verifying the payment flow is wired up correctly.
+
+### Using the test binary
+
+There's a built-in test client:
+
+```sh
+# Uses default prompt ("a cyberpunk cat furiously coding on a laptop with a background like The Matrix virtual world")
+cargo run --bin test_image
+
+# Custom prompt (use -- to separate cargo args from your prompt)
+cargo run --bin test_image -- a sunset over mountains
+```
+
+This hits `/generate_image` on your running server and prints the result. Make sure the server is already running (with `TEST_MODE=1` if you want to skip payment).
+
+### Other useful routes
+
+```sh
+# Health check
+curl http://localhost:3402/api/health
+
+# Service info (JSON) — lists endpoints, token, network
+curl http://localhost:3402/api
+
+# Human-readable service info
+curl http://localhost:3402/
 ```
 
 ## Requirements

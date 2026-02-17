@@ -7,7 +7,7 @@ fn main() {
 
     let prompt = env::args().skip(1).collect::<Vec<_>>().join(" ");
     let prompt = if prompt.is_empty() {
-        "a cyberpunk cat riding a skateboard through neon streets".to_string()
+        "a cyberpunk cat furiously coding on a laptop with a background like The Matrix virtual world".to_string()
     } else {
         prompt
     };
