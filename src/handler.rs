@@ -51,9 +51,32 @@ pub async fn handle_generate(
     req: HttpRequest,
     state: web::Data<AppState>,
     quality_map: web::Data<QualityMap>,
-    body: web::Json<PromptQuery>,
+    body: web::Bytes,
 ) -> HttpResponse {
-    let quality = &body.quality;
+    // Try JSON body first, then fall back to query params
+    let query: PromptQuery = if body.is_empty() {
+        // No body — try query params
+        match web::Query::<PromptQuery>::from_query(req.query_string()) {
+            Ok(q) => q.into_inner(),
+            Err(_) => PromptQuery {
+                prompt: None,
+                quality: default_quality(),
+            },
+        }
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(q) => q,
+            Err(_json_err) => {
+                return HttpResponse::BadRequest().json(serde_json::json!({
+                    "error": "Invalid JSON body. Expected: {\"prompt\": \"...\", \"quality\": \"low|medium|high\"}",
+                    "example": { "prompt": "a cute cat", "quality": "medium" },
+                    "hint": "Send a POST with a JSON body. Query parameters are also accepted if the body is empty."
+                }));
+            }
+        }
+    };
+
+    let quality = &query.quality;
     let endpoint = match quality_map.get(quality.as_str()) {
         Some(ep) => ep,
         None => {
@@ -64,7 +87,7 @@ pub async fn handle_generate(
         }
     };
 
-    match handle_endpoint_inner(&state, &req, body.prompt.as_deref(), endpoint, quality).await {
+    match handle_endpoint_inner(&state, &req, query.prompt.as_deref(), endpoint, quality).await {
         Ok(resp) => resp,
         Err(resp) => resp,
     }
